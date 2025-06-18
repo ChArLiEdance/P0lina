@@ -70,6 +70,7 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
 def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
                   near=0., far=1.,
                   use_viewdirs=False, c2w_staticcam=None,
+                  use_nerfacc=False,
                   **kwargs):
     """Render rays
     Args:
@@ -132,7 +133,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         rays = torch.cat([rays, viewdirs], -1)
 
     # Render and reshape
-    all_ret = batchify_rays(rays, chunk, **kwargs)
+    all_ret = batchify_rays(rays, chunk, use_nerfacc=use_nerfacc, **kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = torch.reshape(all_ret[k], k_sh)
@@ -272,6 +273,7 @@ def create_nerf(args):
         'use_viewdirs' : args.use_viewdirs,
         'white_bkgd' : args.white_bkgd,
         'raw_noise_std' : args.raw_noise_std,
+        'use_nerfacc' : args.use_nerfacc,
     }
 
     # NDC only good for LLFF-style forward facing data
@@ -283,12 +285,16 @@ def create_nerf(args):
     render_kwargs_test = {k : render_kwargs_train[k] for k in render_kwargs_train}
     render_kwargs_test['perturb'] = False
     render_kwargs_test['raw_noise_std'] = 0.
+    render_kwargs_test['use_nerfacc'] = args.use_nerfacc
 
     return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
 
 #大工式的代码表示 
 #体渲染代码
-def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
+from nerfacc.volrend import rendering
+
+
+def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False, use_nerfacc=False):
     """Transforms model's predictions to semantically meaningful values.
     Args:
         raw: [num_rays, num_samples along ray, 4]. Prediction from model.
@@ -301,30 +307,57 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         weights: [num_rays, num_samples]. Weights assigned to each sampled color.
         depth_map: [num_rays]. Estimated distance to object.
     """
-    #定义从密度 σ 到 α（不透明度）的转换函数
+
+    if use_nerfacc:
+        dists = z_vals[..., 1:] - z_vals[..., :-1]
+        dists = torch.cat([
+            dists,
+            torch.tensor([1e10], device=dists.device).expand(dists[..., :1].shape),
+        ], -1)
+
+        t_starts = z_vals
+        t_ends = z_vals + dists
+
+        rgbs = torch.sigmoid(raw[..., :3])
+        sigmas = F.relu(raw[..., 3])
+
+        def rgb_sigma_fn(ts, te, ri=None):
+            return rgbs, sigmas
+
+        rgb_map, acc_map, depth_map, extras = rendering(
+            t_starts,
+            t_ends,
+            rgb_sigma_fn=rgb_sigma_fn,
+            render_bkgd=torch.ones(3, device=rgbs.device) if white_bkgd else None,
+            expected_depths=False,
+        )
+
+        weights = extras["weights"]
+        disp_map = 1.0 / torch.max(
+            1e-10 * torch.ones_like(depth_map), depth_map / acc_map
+        )
+        acc_map = acc_map.squeeze(-1)
+        depth_map = depth_map.squeeze(-1)
+        return rgb_map, disp_map, acc_map, weights, depth_map
+
     raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
-    #计算相邻深度间隔 dists
     dists = z_vals[...,1:] - z_vals[...,:-1]
-    dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
+    dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)
 
     dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
 
-    rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]
-    #把网络输出的前三维 (r,g,b) 通过 sigmoid 映射到 (0,1)，得到实际颜色。
+    rgb = torch.sigmoid(raw[...,:3])
     noise = 0.
     if raw_noise_std > 0.:
         noise = torch.randn(raw[...,3].shape) * raw_noise_std
-
-        # Overwrite randomly sampled data if pytest
         if pytest:
             np.random.seed(0)
             noise = np.random.rand(*list(raw[...,3].shape)) * raw_noise_std
             noise = torch.Tensor(noise)
 
-    alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
-    # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
-    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
-    rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
+    alpha = raw2alpha(raw[...,3] + noise, dists)
+    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)),1.-alpha + 1e-10], -1), -1)[:, :-1]
+    rgb_map = torch.sum(weights[...,None] * rgb, -2)
 
     depth_map = torch.sum(weights * z_vals, -1)
     disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
@@ -334,7 +367,6 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         rgb_map = rgb_map + (1.-acc_map[...,None])
 
     return rgb_map, disp_map, acc_map, weights, depth_map
-
 
 def render_rays(ray_batch,
                 network_fn,
@@ -348,7 +380,8 @@ def render_rays(ray_batch,
                 white_bkgd=False,
                 raw_noise_std=0.,
                 verbose=False,
-                pytest=False):
+                pytest=False,
+                use_nerfacc=False):
     """Volumetric rendering.
     Args:
       ray_batch: array of shape [batch_size, ...]. All information necessary
@@ -422,7 +455,7 @@ def render_rays(ray_batch,
     #[..., :3] 是 (r,g,b)，[...,3] 是密度 𝜎
     raw = network_query_fn(pts, viewdirs, network_fn)
 
-    rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+    rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, use_nerfacc=use_nerfacc)
     #两阶段重要性采样
     if N_importance > 0:
 
@@ -439,7 +472,7 @@ def render_rays(ray_batch,
 #         raw = run_network(pts, fn=run_fn)
         raw = network_query_fn(pts, viewdirs, run_fn)
 
-        rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+        rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, use_nerfacc=use_nerfacc)
     #打包返回
     ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map}
     if retraw:
@@ -513,8 +546,10 @@ def config_parser():
                         help='log2 of max freq for positional encoding (3D location)')
     parser.add_argument("--multires_views", type=int, default=4, 
                         help='log2 of max freq for positional encoding (2D direction)')
-    parser.add_argument("--raw_noise_std", type=float, default=0., 
+    parser.add_argument("--raw_noise_std", type=float, default=0.,
                         help='std dev of noise added to regularize sigma_a output, 1e0 recommended')
+    parser.add_argument("--use_nerfacc", action='store_true',
+                        help='use nerfacc for accelerated rendering')
 
     parser.add_argument("--render_only", action='store_true', 
                         help='do not optimize, reload weights and render out render_poses path')
