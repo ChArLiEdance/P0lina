@@ -10,15 +10,15 @@ import torch.nn.functional as F
 from tqdm import tqdm, trange
 import torch.profiler
 import matplotlib.pyplot as plt
-
+import inspect
 from run_nerf_helpers import *
-
+import torch._dynamo
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 from load_LINEMOD import load_LINEMOD_data
 
-
+torch.backends.cudnn.benchmark = True
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
 DEBUG = False
@@ -214,6 +214,12 @@ def create_nerf(args):
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
                  input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
+     # ——— PyTorch 2.0+ 动态图编译 ———
+    #model = torch.compile(model, mode="default")
+    # —————————————————————————————
+    # 立刻打印一下
+
+    print(model)
     grad_vars = list(model.parameters())
     
 
@@ -224,7 +230,11 @@ def create_nerf(args):
         model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
                           input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
+        # ——— PyTorch 2.0+ 动态图编译 ———
+        # 如果有细网，也一并编译
+        #model_fine = torch.compile(model_fine, mode="default")
         grad_vars += list(model_fine.parameters())
+   
     #构造网络查询参数
     network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
                                                                 embed_fn=embed_fn,
@@ -240,13 +250,22 @@ def create_nerf(args):
     expname = args.expname
 
     ##########################
+   # wrap for multi-GPU
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs via DataParallel")
+        model = nn.DataParallel(model)
+        if model_fine is not None:
+            model_fine = nn.DataParallel(model_fine)
+
     #加载已有的检查点
     # Load checkpoints
     if args.ft_path is not None and args.ft_path!='None':
         ckpts = [args.ft_path]
     else:
         ckpts = [os.path.join(basedir, expname, f) for f in sorted(os.listdir(os.path.join(basedir, expname))) if 'tar' in f]
+    
 
+    
     print('Found ckpts', ckpts)
     if len(ckpts) > 0 and not args.no_reload:
         ckpt_path = ckpts[-1]
@@ -256,11 +275,24 @@ def create_nerf(args):
         start = ckpt['global_step']
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
 
-        # Load model
-        model.load_state_dict(ckpt['network_fn_state_dict'])
+        # # Load model
+        # model.load_state_dict(ckpt['network_fn_state_dict'])
+        # if model_fine is not None:
+        #     model_fine.load_state_dict(ckpt['network_fine_state_dict'])
+        # 如果 model 是编译/优化后的 OptimizedModule，要先拿 _orig_mod
+        # base = getattr(model, "_orig_mod", model)
+        # base.load_state_dict(ckpt["network_fn_state_dict"])
         if model_fine is not None:
-            model_fine.load_state_dict(ckpt['network_fine_state_dict'])
+            base_fine = getattr(model_fine, "_orig_mod", model_fine)
+            base_fine.load_state_dict(ckpt["network_fine_state_dict"])
 
+
+    # # wrap for multi-GPU
+    # if torch.cuda.device_count() > 1:
+    #     print(f"Using {torch.cuda.device_count()} GPUs via DataParallel")
+    #     model = nn.DataParallel(model)
+    #     if model_fine is not None:
+    #         model_fine = nn.DataParallel(model_fine)
     ##########################
 
     render_kwargs_train = {
@@ -329,7 +361,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
             t_ends,
             rgb_sigma_fn=rgb_sigma_fn,
             render_bkgd=torch.ones(3, device=rgbs.device) if white_bkgd else None,
-            expected_depths=False,
+            #expected_depths=False,
         )
 
         weights = extras["weights"]
@@ -520,9 +552,9 @@ def config_parser():
                         help='learning rate')
     parser.add_argument("--lrate_decay", type=int, default=250, 
                         help='exponential learning rate decay (in 1000 steps)')
-    parser.add_argument("--chunk", type=int, default=1024*256, 
+    parser.add_argument("--chunk", type=int, default=1024*512, 
                         help='number of rays processed in parallel, decrease if running out of memory')
-    parser.add_argument("--netchunk", type=int, default=1024*512, 
+    parser.add_argument("--netchunk", type=int, default=1024*1024, 
                         help='number of pts sent through network in parallel, decrease if running out of memory')
     parser.add_argument("--no_batching", action='store_true', 
                         help='only take random rays from 1 image at a time')
@@ -796,7 +828,7 @@ def train():
     start = start + 1
     for i in trange(start, N_iters):
         time0 = time.time()
-
+        #time0_full = time.time()
         # Sample random ray batch
         if use_batching:
             # Random over all images
@@ -848,10 +880,12 @@ def train():
 
 
         #####  Core optimization loop  #####
+        #t0 = time.time()
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
-
+        #t1 = time.time()
+        #print(f"[step {i:06d}] render-time = {(t1-t0)*1000:.1f} ms, total-step-time = {(time.time()-time0_full)*1000:.1f} ms")
         optimizer.zero_grad()
         img_loss = img2mse(rgb, target_s)
         trans = extras['raw'][...,-1]
