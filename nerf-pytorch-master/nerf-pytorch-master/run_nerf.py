@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm, trange
-
+import torch.profiler
 import matplotlib.pyplot as plt
 
 from run_nerf_helpers import *
@@ -487,9 +487,9 @@ def config_parser():
                         help='learning rate')
     parser.add_argument("--lrate_decay", type=int, default=250, 
                         help='exponential learning rate decay (in 1000 steps)')
-    parser.add_argument("--chunk", type=int, default=1024*32, 
+    parser.add_argument("--chunk", type=int, default=1024*256, 
                         help='number of rays processed in parallel, decrease if running out of memory')
-    parser.add_argument("--netchunk", type=int, default=1024*64, 
+    parser.add_argument("--netchunk", type=int, default=1024*512, 
                         help='number of pts sent through network in parallel, decrease if running out of memory')
     parser.add_argument("--no_batching", action='store_true', 
                         help='only take random rays from 1 image at a time')
@@ -748,7 +748,16 @@ def train():
 
     # Summary writers
     # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
-    
+
+    # profiler = torch.profiler.profile(
+    #     schedule=torch.profiler.schedule(wait=1, warmup=1, active=3),
+    #     on_trace_ready=torch.profiler.tensorboard_trace_handler('./prof_logs'),
+    #     record_shapes=True,
+    #     profile_memory=True,
+    #     with_stack=True,
+    # )
+    # profiler.start()
+
     start = start + 1
     for i in trange(start, N_iters):
         time0 = time.time()
@@ -798,6 +807,11 @@ def train():
                 batch_rays = torch.stack([rays_o, rays_d], 0)
                 target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
+
+        # if i < 5:                   # 只 profile 前 5 个 step
+        #     profiler.step()
+
+
         #####  Core optimization loop  #####
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
@@ -816,6 +830,13 @@ def train():
 
         loss.backward()
         optimizer.step()
+
+
+        # if i == 4:
+        #     profiler.stop()
+        #     print("Profiling 数据已写入 ./prof_logs ，请用 tensorboard --logdir=./prof_logs 查看")
+        # # … 后面原来的保存、logging 等逻辑 …
+
 
         # NOTE: IMPORTANT!
         ###   update learning rate   ###
