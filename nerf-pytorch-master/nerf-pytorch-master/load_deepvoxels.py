@@ -8,6 +8,7 @@ def load_dv_data(scene='cube', basedir='/data/deepvoxels', testskip=8):
 
     def parse_intrinsics(filepath, trgt_sidelength, invert_y=False):
         # Get camera intrinsics
+        # 并计算相机的焦距、主点坐标和相机内参矩阵
         with open(filepath, 'r') as file:
             f, cx, cy = list(map(float, file.readline().split()))[:3]
             grid_barycenter = np.array(list(map(float, file.readline().split())))
@@ -45,7 +46,7 @@ def load_dv_data(scene='cube', basedir='/data/deepvoxels', testskip=8):
 
         return full_intrinsic, grid_barycenter, scale, near_plane, world2cam_poses
 
-
+    #读位姿矩阵文件，并转换成4*4的变换矩阵
     def load_pose(filename):
         assert os.path.isfile(filename)
         nums = open(filename).read().split()
@@ -61,7 +62,7 @@ def load_dv_data(scene='cube', basedir='/data/deepvoxels', testskip=8):
     focal = full_intrinsic[0,0]
     print(H, W, focal)
 
-    
+    #把所有的位姿文件加载到一个numpy数组中，并进行坐标变换
     def dir2poses(posedir):
         poses = np.stack([load_pose(os.path.join(posedir, f)) for f in sorted(os.listdir(posedir)) if f.endswith('txt')], 0)
         transf = np.array([
@@ -80,7 +81,7 @@ def load_dv_data(scene='cube', basedir='/data/deepvoxels', testskip=8):
     testposes = testposes[::testskip]
     valposes = dir2poses('{}/validation/{}/pose'.format(basedir, scene))
     valposes = valposes[::testskip]
-
+    #加载图像数据
     imgfiles = [f for f in sorted(os.listdir(os.path.join(deepvoxels_base, 'rgb'))) if f.endswith('png')]
     imgs = np.stack([imageio.imread(os.path.join(deepvoxels_base, 'rgb', f))/255. for f in imgfiles], 0).astype(np.float32)
     

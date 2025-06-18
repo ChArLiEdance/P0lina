@@ -26,6 +26,7 @@ DEBUG = False
 
 def batchify(fn, chunk):
     """Constructs a version of 'fn' that applies to smaller batches.
+    分批次处理，避免内存溢出
     """
     if chunk is None:
         return fn
@@ -37,17 +38,17 @@ def batchify(fn, chunk):
 def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'.
     """
-    inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
-    embedded = embed_fn(inputs_flat)
-
+    inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])#扁平化输入点
+    embedded = embed_fn(inputs_flat)#对3D坐标进行位置编码
+    #加入视角编码
     if viewdirs is not None:
         input_dirs = viewdirs[:,None].expand(inputs.shape)
-        input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
-        embedded_dirs = embeddirs_fn(input_dirs_flat)
-        embedded = torch.cat([embedded, embedded_dirs], -1)
+        input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])#扁平化输入视角
+        embedded_dirs = embeddirs_fn(input_dirs_flat)#对2D视角进行位置编码
+        embedded = torch.cat([embedded, embedded_dirs], -1)#拼接位置和方向
 
-    outputs_flat = batchify(fn, netchunk)(embedded)
-    outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
+    outputs_flat = batchify(fn, netchunk)(embedded)#拆分运行fn
+    outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])#拼回去
     return outputs
 
 
@@ -92,13 +93,16 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
       acc_map: [batch_size]. Accumulated opacity (alpha) along a ray.
       extras: dict with everything returned by render_rays().
     """
+    # 得到射线的起点和方向
     if c2w is not None:
         # special case to render full image
         rays_o, rays_d = get_rays(H, W, K, c2w)
     else:
         # use provided ray batch
         rays_o, rays_d = rays
-
+    #目的：NeRF 可选地把 3D 坐标与视角方向一起编码，提升视角依赖效果（如高光）。
+    #c2w_staticcam：如果想“固定视角”来测试仅位置编码的变化，
+    #就用一个不同的相机矩阵生成 rays_o/rays_d，但 viewdirs 仍来自原 c2w。
     if use_viewdirs:
         # provide ray directions as input
         viewdirs = rays_d
@@ -107,18 +111,23 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
             rays_o, rays_d = get_rays(H, W, K, c2w_staticcam)
         viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
         viewdirs = torch.reshape(viewdirs, [-1,3]).float()
-
+    #保存原始射线网格形状并进行 NDC 投影
     sh = rays_d.shape # [..., 3]
     if ndc:
         # for forward facing scenes
         rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)
 
-    # Create ray batch
+    # 扁平化所有射线：不论原来是 [H,W] 还是 [batch]，最后都是 [N,3]
     rays_o = torch.reshape(rays_o, [-1,3]).float()
     rays_d = torch.reshape(rays_d, [-1,3]).float()
 
-    near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1])
+    # 扩展 near/far 成 [N,1]
+    near = near * torch.ones_like(rays_d[...,:1])
+    far  = far  * torch.ones_like(rays_d[...,:1])
+    # 拼成 [N, 3+3+1+1] = [N,8]
     rays = torch.cat([rays_o, rays_d, near, far], -1)
+
+    # 如果要传入 viewdirs，则再拼接成 [N,11]
     if use_viewdirs:
         rays = torch.cat([rays, viewdirs], -1)
 
@@ -135,7 +144,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
 
 
 def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0):
-
+    #提取高度、宽度和焦距
     H, W, focal = hwf
 
     if render_factor!=0:
@@ -151,7 +160,7 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
     for i, c2w in enumerate(tqdm(render_poses)):
         print(i, time.time() - t)
         t = time.time()
-        rgb, disp, acc, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)
+        rgb, disp, acc, _ = render(H, W, K, chunk=chunk, c2w=c2w[:3,:4], **render_kwargs)#调用render渲染单帧
         rgbs.append(rgb.cpu().numpy())
         disps.append(disp.cpu().numpy())
         if i==0:
@@ -178,18 +187,36 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
+    #位置编码
     embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
-
+    #视角编码
     input_ch_views = 0
     embeddirs_fn = None
     if args.use_viewdirs:
         embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
     output_ch = 5 if args.N_importance > 0 else 4
     skips = [4]
+    '''
+        NeRF(...)
+
+    D：MLP 深度（层数），W：每层的宽度（隐藏单元数）。
+
+    input_ch：位置编码后的维度，input_ch_views：方向编码后的维度（若使用）。
+
+    use_viewdirs：是否在网络中把视角方向拼接进隐藏层。
+
+    .to(device)：把模型搬到 GPU（或 CPU）上。
+
+    grad_vars：优化器要更新的参数列表，最初只包含粗网的参数。
+    '''
+    #构建粗网
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
                  input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
     grad_vars = list(model.parameters())
+    
+
+    #构件细网
 
     model_fine = None
     if args.N_importance > 0:
@@ -197,21 +224,22 @@ def create_nerf(args):
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
                           input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
         grad_vars += list(model_fine.parameters())
-
+    #构造网络查询参数
     network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
                                                                 embed_fn=embed_fn,
                                                                 embeddirs_fn=embeddirs_fn,
                                                                 netchunk=args.netchunk)
 
     # Create optimizer
+    #adam
     optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
-
+    #准备恢复训练的起始步数与路径信息
     start = 0
     basedir = args.basedir
     expname = args.expname
 
     ##########################
-
+    #加载已有的检查点
     # Load checkpoints
     if args.ft_path is not None and args.ft_path!='None':
         ckpts = [args.ft_path]
@@ -251,14 +279,15 @@ def create_nerf(args):
         print('Not ndc!')
         render_kwargs_train['ndc'] = False
         render_kwargs_train['lindisp'] = args.lindisp
-
+    #测试时不做随机扰动，不加噪声，保证可复现的渲染结果
     render_kwargs_test = {k : render_kwargs_train[k] for k in render_kwargs_train}
     render_kwargs_test['perturb'] = False
     render_kwargs_test['raw_noise_std'] = 0.
 
     return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
 
-
+#大工式的代码表示 
+#体渲染代码
 def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
     """Transforms model's predictions to semantically meaningful values.
     Args:
@@ -272,14 +301,16 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         weights: [num_rays, num_samples]. Weights assigned to each sampled color.
         depth_map: [num_rays]. Estimated distance to object.
     """
+    #定义从密度 σ 到 α（不透明度）的转换函数
     raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
-
+    #计算相邻深度间隔 dists
     dists = z_vals[...,1:] - z_vals[...,:-1]
     dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
 
     dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
 
     rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]
+    #把网络输出的前三维 (r,g,b) 通过 sigmoid 映射到 (0,1)，得到实际颜色。
     noise = 0.
     if raw_noise_std > 0.:
         noise = torch.randn(raw[...,3].shape) * raw_noise_std
@@ -355,13 +386,16 @@ def render_rays(ray_batch,
     near, far = bounds[...,0], bounds[...,1] # [-1,1]
 
     t_vals = torch.linspace(0., 1., steps=N_samples)
+    #粗略采样点
     if not lindisp:
-        z_vals = near * (1.-t_vals) + far * (t_vals)
+        z_vals = near * (1.-t_vals) + far * (t_vals)#线性深度采样
     else:
-        z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
+        z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))#等视差采样
 
     z_vals = z_vals.expand([N_rays, N_samples])
-
+    #分层随机扰动
+    #将每个相邻采样点区间 [z_i, z_{i+1}] 视为一层
+    #，然后在层内做均匀随机采样，使得采样点更有随机性，有助于防止条带狀伪影。
     if perturb > 0.:
         # get intervals between samples
         mids = .5 * (z_vals[...,1:] + z_vals[...,:-1])
@@ -377,14 +411,19 @@ def render_rays(ray_batch,
             t_rand = torch.Tensor(t_rand)
 
         z_vals = lower + (upper - lower) * t_rand
-
+    #构造三维空间采样点
+    #将每条射线的起点 o 加上方向 d 乘以各自的深度 z，得到实际的 3D 坐标
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
 
 
 #     raw = run_network(pts)
+    #network_query_fn：先对 pts（和方向）做高频编码再送给
+    #network_fn，输出 raw，形状 [N_rays, N_samples, 4]，
+    #[..., :3] 是 (r,g,b)，[...,3] 是密度 𝜎
     raw = network_query_fn(pts, viewdirs, network_fn)
-    rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
+    rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+    #两阶段重要性采样
     if N_importance > 0:
 
         rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
@@ -401,7 +440,7 @@ def render_rays(ray_batch,
         raw = network_query_fn(pts, viewdirs, run_fn)
 
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
-
+    #打包返回
     ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map}
     if retraw:
         ret['raw'] = raw
@@ -419,7 +458,7 @@ def render_rays(ray_batch,
 
 
 def config_parser():
-
+ 
     import configargparse
     parser = configargparse.ArgumentParser()
     parser.add_argument('--config', is_config_file=True, 
@@ -432,6 +471,7 @@ def config_parser():
                         help='input data directory')
 
     # training options
+    #粗网和细网的结构
     parser.add_argument("--netdepth", type=int, default=8, 
                         help='layers in network')
     parser.add_argument("--netwidth", type=int, default=256, 
@@ -440,6 +480,7 @@ def config_parser():
                         help='layers in fine network')
     parser.add_argument("--netwidth_fine", type=int, default=256, 
                         help='channels per layer in fine network')
+
     parser.add_argument("--N_rand", type=int, default=32*32*4, 
                         help='batch size (number of random rays per gradient step)')
     parser.add_argument("--lrate", type=float, default=5e-4, 
@@ -535,7 +576,8 @@ def train():
 
     parser = config_parser()
     args = parser.parse_args()
-
+    #作用：调用前面定义的 config_parser()，、
+    #根据用户在命令行或配置文件里传入的选项，生成一个 args 对象，包含所有超参数、文件路径、开关标志等。
     # Load data
     K = None
     if args.dataset_type == 'llff':
@@ -697,7 +739,7 @@ def train():
     if use_batching:
         rays_rgb = torch.Tensor(rays_rgb).to(device)
 
-    N_iters = 2000 + 1
+    N_iters = 200000 + 1
    # N_iters = 200000 + 1
     print('Begin')
     print('TRAIN views are', i_train)
@@ -747,7 +789,7 @@ def train():
                         print(f"[Config] Center cropping of size {2*dH} x {2*dW} is enabled until iter {args.precrop_iters}")                
                 else:
                     coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
-
+                #粒子的采集，光线代码
                 coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
                 select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
                 select_coords = coords[select_inds].long()  # (N_rand, 2)
