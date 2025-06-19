@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright 2022 Google LLC
+# Copyright 2021 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,14 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Script for training on the Blender dataset.
 
-python -m unittest tests.camera_utils_test
-python -m unittest tests.geopoly_test
-python -m unittest tests.stepfun_test
-python -m unittest tests.coord_test
-python -m unittest tests.image_test
-python -m unittest tests.ref_utils_test
-python -m unittest tests.utils_test
-python -m unittest tests.datasets_test
-python -m unittest tests.math_test
-python -m unittest tests.render_test
+SCENE=lego
+EXPERIMENT=debug
+TRAIN_DIR=/Users/barron/tmp/nerf_results/$EXPERIMENT/$SCENE
+DATA_DIR=/Users/barron/data/nerf_synthetic/$SCENE
+
+rm $TRAIN_DIR/*
+python -m train \
+  --data_dir=$DATA_DIR \
+  --train_dir=$TRAIN_DIR \
+  --gin_file=configs/blender.gin \
+  --logtostderr
