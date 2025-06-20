@@ -20,6 +20,7 @@ from load_LINEMOD import load_LINEMOD_data
 
 torch.backends.cudnn.benchmark = True
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.set_default_device(device)
 np.random.seed(0)
 DEBUG = False
 
