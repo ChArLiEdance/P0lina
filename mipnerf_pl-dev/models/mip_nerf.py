@@ -104,6 +104,8 @@ class MLP(torch.nn.Module):
             # have the same viewdir.
             # view_direction: [B, 2*3*L] -> [B, N, 2*3*L]
             view_direction = repeat(view_direction, 'batch feature -> batch sample feature', sample=num_samples)
+            if hasattr(torch.cuda, 'empty_cache'):
+                torch.cuda.empty_cache()
             x = torch.cat([bottleneck, view_direction], dim=-1)
             # Here use 1 extra layer to align with the original nerf model.
             x = self.view_layers(x)

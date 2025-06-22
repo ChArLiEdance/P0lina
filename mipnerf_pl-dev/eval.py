@@ -10,9 +10,7 @@ from utils.vis import save_images
 from render_video import generate_video
 from models.mip import rearrange_render_image
 from models.nerf_system import MipNeRFSystem
-import torch.serialization
-from numpy.core.multiarray import scalar
-torch.serialization.add_safe_globals({scalar})
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--ckpt", help="Path to ckpt.")
 parser.add_argument("--data", help="Path to data.")
@@ -60,8 +58,7 @@ def main(args):
             distances, accs = [], []
             with torch.no_grad():
                 for batch_rays in single_image_rays:
-                    _, fine = model(batch_rays, False, args.white_bkgd)
-                    f_rgb, distance, acc = fine[:3]
+                    _, (f_rgb, distance, acc) = model(batch_rays, False, args.white_bkgd)
                     fine_rgb.append(f_rgb)
                     distances.append(distance)
                     accs.append(acc)
@@ -78,22 +75,7 @@ def main(args):
             ssim_values.append(ssim_val.cpu().item())
             out_path = os.path.join(args.out_dir, 'test', exp_name, str(int(args.base_size[0] / width)))
             if args.save_image:
-                #save_images(fine_rgb, distances, accs, out_path, n)
-                import numpy as np
-
-                # 1. RGB: N H W C → CPU NumPy
-                fine_rgb_np = fine_rgb.cpu().numpy()
-
-                # 2. 深度和可见度：H W（float）→ 归一化 → uint8
-                dist = distances.cpu().numpy()
-                # 按照最大值归一化到 [0,255]
-                dist_norm = (255 * (dist - dist.min()) / (dist.max() - dist.min() + 1e-8))
-                dist_uint8 = dist_norm.astype(np.uint8)
-
-                acc = accs.cpu().numpy()
-                # acc 本身通常在 [0,1]，直接映射
-                acc_uint8 = (255 * acc).astype(np.uint8)
-                save_images(fine_rgb_np, dist_uint8, acc_uint8, out_path, n)
+                save_images(fine_rgb, distances, accs, out_path, n)
         with open(os.path.join(args.out_dir, 'test', exp_name, 'psnrs.txt'), 'w') as f:
             f.write(' '.join([str(v) for v in psnr_values]))
         with open(os.path.join(args.out_dir, 'test', exp_name, 'ssims.txt'), 'w') as f:
