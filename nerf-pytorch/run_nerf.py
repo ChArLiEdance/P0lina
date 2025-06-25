@@ -12,7 +12,7 @@ import torch.profiler
 import matplotlib.pyplot as plt
 import inspect
 from run_nerf_helpers import *
-import torch._dynamo
+#import torch._dynamo
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
@@ -20,7 +20,7 @@ from load_LINEMOD import load_LINEMOD_data
 
 torch.backends.cudnn.benchmark = True
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-torch.set_default_device(device)
+#torch.set_default_device(device)
 np.random.seed(0)
 DEBUG = False
 
