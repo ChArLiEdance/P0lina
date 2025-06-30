@@ -1,0 +1,16 @@
+numpy<2.0.0
+pyyaml
+tqdm
+opencv-python
+imgaug
+lpips
+einops
+plyfile
+tensorboardX
+termcolor
+trimesh
+sympy
+imageio
+imageio-ffmpeg
+matplotlib
+torchmetrics
