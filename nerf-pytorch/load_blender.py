@@ -118,6 +118,8 @@ def load_blender_data(basedir, half_res=False, testskip=1):
     H, W = imgs[0].shape[:2] #获取图像的高度和宽度
     camera_angle_x = float(meta['camera_angle_x'])#获取相机的水平视角
     focal = .5 * W / np.tan(.5 * camera_angle_x)#计算焦距
+
+    
     #生成渲染时的相机位姿
     render_poses = torch.stack([pose_spherical(angle, -30.0, 4.0) for angle in np.linspace(-180,180,40+1)[:-1]], 0)
     #处理半分辨率的情况

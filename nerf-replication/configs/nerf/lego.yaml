@@ -42,7 +42,7 @@ network:
     freq: 4 # dimensions of encoding direction
 
 train_dataset:
-  data_root: "data/nerf_synthetic"
+  data_root: "data/nerf_synthetic/lego"
   split: "train"
   input_ratio: 1. # whether to downsampling the image, you can set it to 0.5 to acclerate training
   cams: [0, -1, 1] # input cameras, you can use this variable to select training images
@@ -50,7 +50,7 @@ train_dataset:
   W: 800
 
 test_dataset:
-  data_root: "data/nerf_synthetic"
+  data_root: "data/nerf_synthetic/lego"
   split: "test"
   input_ratio: 0.5
   cams: [0, -1, 100]
