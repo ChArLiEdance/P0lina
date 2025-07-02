@@ -85,7 +85,8 @@ class Dataset(data.Dataset):
         self.cams = kwargs.get('cams', None)
         self.half_res = kwargs.get('half_res', False)
         self.testskip = kwargs.get('testskip', 1)
-        
+        self.near = 2.0
+        self.far = 6.0
         
         # 读取 transforms_xxx.json
         json_path = os.path.join(self.data_root, f"transforms_{self.split}.json")
@@ -136,6 +137,8 @@ class Dataset(data.Dataset):
 
         # 将所有图像和位姿合并为一个大数组
         self.all_rgbs = np.concatenate(self.all_rgbs, 0)
+        if self.all_rgbs.shape[-1] == 4:
+            self.all_rgbs = self.all_rgbs[..., :3]
         self.pose=np.concatenate(self.poses, 0).astype(np.float32)
         self.H_ori, self.W_ori = self.all_rgbs.shape[1], self.all_rgbs.shape[2]
 
@@ -146,8 +149,8 @@ class Dataset(data.Dataset):
             new_W = int(self.W_ori * self.input_ratio)
             imgs_resized = np.zeros((self.all_rgbs.shape[0], new_H, new_W, 3), dtype=np.float32)
             for i, img in enumerate(self.all_rgbs):
-                if img.shape[-1] == 4:
-                    img = img[..., :3]
+                # if img.shape[-1] == 4:
+                #     img = img[..., :3]
                 imgs_resized[i] = cv2.resize(img, (new_W, new_H), interpolation=cv2.INTER_AREA)
                 
             self.all_rgbs = imgs_resized
@@ -241,6 +244,8 @@ class Dataset(data.Dataset):
             "rays_o": torch.from_numpy(rays_o).float(),
             "rays_d": torch.from_numpy(rays_d).float(),
             "rgb": torch.from_numpy(rgbs).float(),
+            "near": torch.full((N_rays, 1), self.near, dtype=torch.float32),  
+            "far": torch.full((N_rays, 1), self.far, dtype=torch.float32),    
         }
         #pass
 

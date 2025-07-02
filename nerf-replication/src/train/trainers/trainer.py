@@ -50,6 +50,7 @@ class Trainer(object):
 
             batch = to_cuda(batch, self.device)
             batch["step"] = self.global_step
+            
             output, loss, loss_stats, image_stats = self.network(batch)
 
             # training stage: loss; optimizer; scheduler
