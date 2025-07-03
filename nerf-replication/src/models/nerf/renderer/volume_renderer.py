@@ -36,13 +36,31 @@ class Renderer:
         near = batch['near']      # [N_rays, 1]
         far = batch['far']        # [N_rays, 1]
         
+        # # 确保维度正确，去除可能的batch维度
+        # print(f"Debug - rays_o shape: {rays_o.shape}")
+        # print(f"Debug - rays_d shape: {rays_d.shape}")
+        # print(f"Debug - near shape: {near.shape}")
+        # print(f"Debug - far shape: {far.shape}")
+
+
+        # 去除batch维度（如果存在）
+        if rays_o.dim() == 3:
+            rays_o = rays_o.squeeze(0)  # [1, 1024, 3] -> [1024, 3]
+        if rays_d.dim() == 3:
+            rays_d = rays_d.squeeze(0)  # [1, 1024, 3] -> [1024, 3]
+        if near.dim() == 3:
+            near = near.squeeze(0)      # [1, 1024, 1] -> [1024, 1]
+        if far.dim() == 3:
+            far = far.squeeze(0)        # [1, 1024, 1] -> [1024, 1]
+
+
         N_rays = rays_o.shape[0]
         device = rays_o.device
 
         # 2. 采样z_vals
         t_vals = torch.linspace(0., 1., steps=self.N_samples, device=device)
         z_vals = near * (1. - t_vals) + far * t_vals  # [N_rays, N_samples]
-        z_vals = z_vals.expand([N_rays, self.N_samples])
+        #z_vals = z_vals.expand([N_rays, self.N_samples])
 
         #分层随机扰动
         #将每个相邻采样点区间 [z_i, z_{i+1}] 视为一层
@@ -63,7 +81,19 @@ class Renderer:
         pts_flat = pts.reshape(-1, 3)
 
         #net forward
-        raw = self.net(pts_flat).reshape(N_rays, self.N_samples, -1)  # [N_rays, N_samples, 4]
+        if hasattr(self.net, 'use_viewdirs') and self.net.use_viewdirs:
+            # 如果有视角信息，需要扩展视角方向
+            viewdirs = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)  # 归一化方向向量 [N_rays, 3]
+            
+            # 将pts_flat重新reshape为Network期望的形状 [N_rays, N_samples, 3]
+            pts_reshaped = pts_flat.reshape(N_rays, self.N_samples, 3)
+            
+            # 使用Network的forward方法，传入正确形状的位置和视角信息
+            raw = self.net.forward(pts_reshaped, viewdirs).reshape(N_rays, self.N_samples, -1)
+        else:
+           # 如果没有视角信息，将pts_flat重新reshape为Network期望的形状
+            raw = self.net.forward(pts).reshape(N_rays, self.N_samples, -1)  # [N_rays, N_samples, 4]
+
 
         #体渲染积分
         rgb_map, disp_map, acc_map = self.raw2outputs(

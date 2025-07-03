@@ -234,7 +234,12 @@ class Dataset(data.Dataset):
         rays=self.rays[select_idx]
         rgbs = self.all_rgbs[select_idx]
         rays_o =rays[:,0]  # [N_rays, 3]
-        rays_d = rays[:, 1]  # [N_rays, 3]
+        rays_d = rays[:, 1]  # [N_rays, 3]..
+
+        #debug
+        # print(f"Debug11 - rays_o shape: {rays_o.shape}")
+        # print(f"Debug11 - rays_d shape: {rays_d.shape}")
+
 
         # 将光线和 RGB 值转换为 torch.Tensor
         # 这里的 rays_o 和 rays_d 分别是光线的起点和方向向量

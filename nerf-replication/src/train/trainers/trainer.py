@@ -24,6 +24,19 @@ class Trainer(object):
         self.device = device
         self.global_step = 0
 
+        # 显示GPU信息
+        if cfg.local_rank == 0:
+            print(f"使用GPU #{cfg.local_rank}: {torch.cuda.get_device_name(cfg.local_rank)}")
+            print(f"GPU #{cfg.local_rank} 内存: {torch.cuda.get_device_properties(cfg.local_rank).total_memory / 1024**3:.1f} GB")
+            if torch.cuda.device_count() > 1:
+                print(f"检测到 {torch.cuda.device_count()} 个GPU:")
+                for i in range(torch.cuda.device_count()):
+                    gpu_name = torch.cuda.get_device_name(i)
+                    gpu_memory = torch.cuda.get_device_properties(i).total_memory / 1024**3
+                    print(f"  GPU #{i}: {gpu_name} ({gpu_memory:.1f} GB)")
+                print(f"当前使用GPU #{cfg.local_rank}")
+
+
     def reduce_loss_stats(self, loss_stats):
         reduced_losses = {k: torch.mean(v) for k, v in loss_stats.items()}
         return reduced_losses
@@ -44,6 +57,12 @@ class Trainer(object):
         max_iter = len(data_loader)
         self.network.train()
         end = time.time()
+
+        # 创建进度条
+        if cfg.local_rank == 0:
+            pbar = tqdm.tqdm(total=max_iter, desc=f"Epoch {epoch}", 
+                           leave=True, ncols=120, position=0)
+
         for iteration, batch in enumerate(data_loader):
             data_time = time.time() - end
             iteration = iteration + 1
@@ -75,6 +94,26 @@ class Trainer(object):
             recorder.data_time.update(data_time)
 
             self.global_step += 1
+
+            # 更新进度条
+            if cfg.local_rank == 0:
+                # 计算训练速度
+                fps = 1.0 / batch_time if batch_time > 0 else 0
+                
+                # 获取当前损失值
+                current_loss = loss.item()
+                
+                # 更新进度条描述
+                pbar.set_postfix({
+                    'Loss': f'{current_loss:.4f}',
+                    'LR': f'{optimizer.param_groups[0]["lr"]:.6f}',
+                    'FPS': f'{fps:.1f}',
+                    #'GPU_Mem': f'{torch.cuda.max_memory_allocated() / 1024**3:.1f}GB'
+                })
+                pbar.update(1)
+
+
+
             if iteration % cfg.log_interval == 0 or iteration == (max_iter - 1):
                 # print training state
                 eta_seconds = recorder.batch_time.global_avg * (max_iter - iteration)
@@ -88,11 +127,17 @@ class Trainer(object):
                 training_state = training_state.format(
                     eta_string, str(recorder), lr, memory
                 )
+
+
+                print("\n")
                 print(training_state)
 
                 # record loss_stats and image_dict
                 recorder.update_image_stats(image_stats)
                 recorder.record("train")
+        # 关闭进度条
+        if cfg.local_rank == 0:
+            pbar.close()
 
     def val(self, epoch, data_loader, evaluator=None, recorder=None):
         self.network.eval()
@@ -100,7 +145,15 @@ class Trainer(object):
         val_loss_stats = {}
         image_stats = {}
         data_size = len(data_loader)
-        for batch in tqdm.tqdm(data_loader):
+
+
+        # 创建验证进度条
+        if cfg.local_rank == 0:
+            pbar = tqdm.tqdm(total=data_size, desc=f"Validation Epoch {epoch}", 
+                           leave=True, ncols=120, position=0)
+
+        
+        for batch in data_loader:
             batch = to_cuda(batch, self.device)
             batch["step"] = recorder.step
             with torch.no_grad():

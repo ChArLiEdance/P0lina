@@ -1,5 +1,5 @@
 task: "nerf_replication"
-gpus: [1] # set gpu device number
+gpus: [0] # set gpu device number
 exp_name: "nerf"
 scene: "lego"
 
@@ -11,8 +11,16 @@ loss_module: src.train.trainers.nerf
 evaluator_module: src.evaluators.nerf
 
 task_arg:
-  N_rays: 1024 # number of rays in each batch
-  chunk_size: 4096 # number of rays processed in parallel
+
+  #for 1GPU
+  # N_rays: 1024 # number of rays in each batch
+  # chunk_size: 4096 # number of rays processed in parallel
+
+  #for 4GPUs
+  N_rays: 2048 # number of rays in each batch
+  chunk_size: 8192 # number of rays processed in parallel
+
+
   white_bkgd: 1 # use white background
   N_samples: 64 # number of samples per ray in coarse network
   N_importance: 128 # number of samples per ray in fine network

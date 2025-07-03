@@ -29,6 +29,25 @@ if cfg.fix_random:
 
 
 def train(cfg, network):
+    
+    
+    if cfg.local_rank == 0:
+        print("=" * 80)
+        print("开始训练 NeRF")
+        print("=" * 80)
+        print(f"任务: {cfg.task}")
+        print(f"场景: {cfg.scene}")
+        print(f"实验名称: {cfg.exp_name}")
+        print(f"总训练轮数: {cfg.train.epoch}")
+        print(f"每轮迭代数: {cfg.ep_iter}")
+        print(f"学习率: {cfg.train.lr}")
+        print(f"批次大小: {cfg.train.batch_size}")
+        print(f"光线数量: {cfg.task_arg.N_rays}")
+        print(f"采样点数: {cfg.task_arg.N_samples}")
+        print(f"使用视角信息: {cfg.task_arg.use_viewdirs}")
+        print("=" * 80)
+
+
 
     save_trained_config(cfg)
     train_loader = make_data_loader(
@@ -62,6 +81,12 @@ def train(cfg, network):
 
         train_loader.dataset.epoch = epoch
 
+
+        if cfg.local_rank == 0:
+            print(f"\n开始第 {epoch + 1}/{cfg.train.epoch} 轮训练")
+            print(f"当前学习率: {optimizer.param_groups[0]['lr']:.6f}")
+
+            
         trainer.train(epoch, train_loader, optimizer, recorder)
         scheduler.step()
 

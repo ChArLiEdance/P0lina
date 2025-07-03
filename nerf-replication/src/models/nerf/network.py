@@ -104,7 +104,7 @@ class NeRF(nn.Module):
         else:
             outputs = self.output_linear(h)
 
-        return outputs , loss, loss_stats, image_stats
+        return outputs
 
 
 
@@ -252,4 +252,4 @@ class Network(nn.Module):
         outputs = torch.reshape(
             outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]]
         )
-        return output
+        return outputs
