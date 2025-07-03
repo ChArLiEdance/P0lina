@@ -249,8 +249,8 @@ class Dataset(data.Dataset):
             "rays_o": torch.from_numpy(rays_o).float(),
             "rays_d": torch.from_numpy(rays_d).float(),
             "rgb": torch.from_numpy(rgbs).float(),
-            "near": torch.full((N_rays, 1), self.near, dtype=torch.float32),  
-            "far": torch.full((N_rays, 1), self.far, dtype=torch.float32),    
+            "near": torch.full((rays_o.shape[0], 1), self.near, dtype=torch.float32),  
+            "far": torch.full((rays_o.shape[0], 1), self.near, dtype=torch.float32),    
         }
         #pass
 

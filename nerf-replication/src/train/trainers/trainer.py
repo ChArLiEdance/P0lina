@@ -133,6 +133,7 @@ class Trainer(object):
                 print(training_state)
 
                 # record loss_stats and image_dict
+                
                 recorder.update_image_stats(image_stats)
                 recorder.record("train")
         # 关闭进度条

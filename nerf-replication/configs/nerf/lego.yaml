@@ -20,6 +20,9 @@ task_arg:
   N_rays: 2048 # number of rays in each batch
   chunk_size: 8192 # number of rays processed in parallel
 
+  #for large datasets, you can set N_rays to 4096 and chunk_size to 16384
+  # N_rays: 4096 # number of rays in each batch
+  # chunk_size: 16384 # number of rays processed in parallel
 
   white_bkgd: 1 # use white background
   N_samples: 64 # number of samples per ray in coarse network
