@@ -6,208 +6,175 @@ from skimage.metrics import structural_similarity as compare_ssim
 import cv2
 import json
 import warnings
-import imageio
+import torch
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
+def to8b(x):
+    return (255*np.clip(x, 0, 1)).astype(np.uint8)
 
 class Evaluator:
-    def __init__(
-        self,
-    ):
+    def __init__(self):
         self.mse = []
         self.psnr = []
         self.ssim = []
         self.imgs = []
-        self.img_idx =0
-        self.all_pred_pixels = []
-        # 创建结果目录
-        os.makedirs(cfg.result_dir, exist_ok=True)
-        os.makedirs(os.path.join(cfg.result_dir, "images"), exist_ok=True)
-
-
-
-        # 获取图像尺寸信息
-        self.H = getattr(cfg.test_dataset, 'H', 800)
-        self.W = getattr(cfg.test_dataset, 'W', 800)
-        self.N_rays = getattr(cfg.task_arg, 'N_rays', 1024)
+        self.img_names = []
 
     def psnr_metric(self, img_pred, img_gt):
         mse = np.mean((img_pred - img_gt) ** 2)
-        psnr = -10 * np.log(mse) / np.log(10)
+        if mse == 0:
+            return float('inf')
+        psnr = -10 * np.log10(mse)
         return psnr
 
     def ssim_metric(self, img_pred, img_gt, batch, id, num_imgs):
+        # 修复：确保 id 是 Python 整数
+        if isinstance(id, torch.Tensor):
+            if id.dim() == 0:
+                id = id.item()
+            else:
+                id = id.flatten()[0].item()
+        id = int(id)
         result_dir = os.path.join(cfg.result_dir, "images")
-        os.system("mkdir -p {}".format(result_dir))
+        os.makedirs(result_dir, exist_ok=True)
+        if isinstance(img_pred, torch.Tensor):
+            img_pred = img_pred.detach().cpu().numpy()
+        if isinstance(img_gt, torch.Tensor):
+            img_gt = img_gt.detach().cpu().numpy()
+        if img_pred.shape != img_gt.shape:
+            raise ValueError(f"Shape mismatch in SSIM: pred={img_pred.shape}, gt={img_gt.shape}")
+        img_pred = np.clip(img_pred, 0, 1)
+        img_gt = np.clip(img_gt, 0, 1)
         cv2.imwrite(
             "{}/view{:03d}_pred.png".format(result_dir, id),
-            (img_pred[..., [2, 1, 0]] * 255),
+            to8b(img_pred[..., [2, 1, 0]])
         )
         cv2.imwrite(
             "{}/view{:03d}_gt.png".format(result_dir, id),
-            (img_gt[..., [2, 1, 0]] * 255),
+            to8b(img_gt[..., [2, 1, 0]])
         )
-        img_pred = (img_pred * 255).astype(np.uint8)
-
-        ssim = compare_ssim(img_pred, img_gt, win_size=101, full=True)
-        return ssim
+        img_pred_uint8 = to8b(img_pred)
+        img_gt_uint8 = to8b(img_gt)
+        if img_pred_uint8.ndim == 3:
+            ssim_val = compare_ssim(
+                img_pred_uint8, img_gt_uint8, 
+                data_range=255, 
+                multichannel=True,
+                channel_axis=-1
+            )
+        else:
+            ssim_val = compare_ssim(
+                img_pred_uint8, img_gt_uint8, 
+                data_range=255
+            )
+        return ssim_val
 
     def evaluate(self, output, batch):
-        """
-        每个batch都计算mse、psnr和ssim，不再保存图片。
-        """
-        pred_rgb = output['rgb_map'].detach().cpu().numpy()  # [N_rays, 3]
-        gt_rgb = batch['rgb'].detach().cpu().numpy()         # [N_rays, 3]
-
-        # 计算MSE
-        mse = np.mean((pred_rgb - gt_rgb) ** 2)
+        # Extract predictions and ground truth
+        if 'rgb_map' in output:
+            img_pred = output['rgb_map']
+        elif 'rgb_pred' in output:
+            img_pred = output['rgb_pred']
+        else:
+            raise KeyError("No RGB prediction found in output")
+        if 'target_s' in batch:
+            img_gt = batch['target_s']
+        else:
+            raise KeyError("No ground truth target found in batch")
+        if isinstance(img_pred, torch.Tensor):
+            img_pred = img_pred.detach().cpu().numpy()
+        if isinstance(img_gt, torch.Tensor):
+            img_gt = img_gt.detach().cpu().numpy()
+        H = batch.get('H', 400)
+        W = batch.get('W', 400)
+        if img_pred.ndim == 3 and img_pred.shape[0] == H and img_pred.shape[1] == W:
+            target_shape = (H, W, 3)
+        elif img_pred.ndim == 2 and img_pred.shape[0] == H * W:
+            img_pred = img_pred.reshape(H, W, 3)
+            target_shape = (H, W, 3)
+        else:
+            if img_pred.size == H * W * 3:
+                img_pred = img_pred.reshape(H, W, 3)
+                target_shape = (H, W, 3)
+            else:
+                raise ValueError(f"Cannot reshape img_pred with shape {img_pred.shape} to ({H}, {W}, 3)")
+        if img_gt.shape != target_shape:
+            if img_gt.size == H * W * 3:
+                img_gt = img_gt.reshape(H, W, 3)
+            else:
+                raise ValueError(f"Cannot reshape img_gt with shape {img_gt.shape} to {target_shape}")
+        img_pred = np.clip(img_pred, 0, 1)
+        img_gt = np.clip(img_gt, 0, 1)
+        mse = np.mean((img_pred - img_gt) ** 2)
+        psnr = self.psnr_metric(img_pred, img_gt)
+        img_idx = batch.get('img_idx', len(self.imgs))
+        if isinstance(img_idx, torch.Tensor):
+            if img_idx.dim() == 0:
+                img_idx = img_idx.item()
+            else:
+                img_idx = img_idx.flatten()[0].item()
+        img_idx = int(img_idx)
+        ssim_val = self.ssim_metric(img_pred, img_gt, batch, img_idx, len(self.imgs))
         self.mse.append(mse)
-
-        # 计算PSNR
-        psnr_val = -10. * np.log10(mse) if mse > 0 else 100.0
-        self.psnr.append(psnr_val)
-
-        # 计算SSIM（每个batch都算一次，按行拼成伪图像）
-        # 这里假设每个batch的像素可以reshape成一张小图（如[N, 3] -> [N, 1, 3]）
-        pred_img = pred_rgb.reshape(-1, 1, 3)
-        gt_img = gt_rgb.reshape(-1, 1, 3)
-        pred_img8 = (np.clip(pred_img, 0, 1) * 255).astype(np.uint8)
-        gt_img8 = (np.clip(gt_img, 0, 1) * 255).astype(np.uint8)
-        try:
-            ssim_val = compare_ssim(pred_img8, gt_img8, win_size=min(7, pred_img8.shape[0]), multichannel=True, data_range=255)
-        except Exception as e:
-            print(f"SSIM计算失败: {e}")
-            ssim_val = 0.0
+        self.psnr.append(psnr)
         self.ssim.append(ssim_val)
-        return None
-
-
-        
-    # def reconstruct_full_image(self, img_batches, key):
-    #     """
-    #     从多个批次重建完整图像
-        
-    #     Args:
-    #         img_batches: 图像批次列表
-    #         key: 'pred' 或 'gt'
-        
-    #     Returns:
-    #         重建的完整图像 [H, W, 3] 或 None
-    #     """
-    #     try:
-    #         # 计算完整图像需要的像素数
-    #         total_pixels = self.H * self.W
-    #         current_pixels = sum(len(batch[key]) for batch in img_batches)
-            
-    #         if current_pixels >= total_pixels:
-    #             # 重建完整图像
-    #             full_img = np.zeros((self.H, self.W, 3), dtype=np.float32)
-    #             pixel_count = 0
-                
-    #             for batch in img_batches:
-    #                 batch_pixels = len(batch[key])
-    #                 if pixel_count + batch_pixels <= total_pixels:
-    #                     # 将批次像素填充到完整图像中
-    #                     start_idx = pixel_count
-    #                     end_idx = pixel_count + batch_pixels
-                        
-    #                     # 计算在完整图像中的位置
-    #                     start_h = start_idx // self.W
-    #                     start_w = start_idx % self.W
-    #                     end_h = end_idx // self.W
-    #                     end_w = end_idx % self.W
-                        
-    #                     # 填充像素
-    #                     if start_h == end_h:
-    #                         # 同一行
-    #                         full_img[start_h, start_w:end_w] = batch[key][:end_w-start_w]
-    #                     else:
-    #                         # 跨行
-    #                         # 第一行
-    #                         first_row_pixels = self.W - start_w
-    #                         full_img[start_h, start_w:] = batch[key][:first_row_pixels]
-                            
-    #                         # 中间完整行
-    #                         for h in range(start_h + 1, end_h):
-    #                             row_start = first_row_pixels + (h - start_h - 1) * self.W
-    #                             row_end = row_start + self.W
-    #                             full_img[h, :] = batch[key][row_start:row_end]
-                            
-    #                         # 最后一行
-    #                         last_row_pixels = end_w
-    #                         last_row_start = first_row_pixels + (end_h - start_h - 1) * self.W
-    #                         full_img[end_h, :last_row_pixels] = batch[key][last_row_start:]
-                        
-    #                     pixel_count += batch_pixels
-                
-    #             return full_img
-            
-    #     except Exception as e:
-    #         print(f"重建图像时出错: {e}")
-    #         return None
-        
-    #     return None
-
+        self.imgs.append(img_pred)
+        self.img_names.append(f"view{img_idx:03d}")
+        print(f"Image {img_idx:03d}: MSE={mse:.6f}, PSNR={psnr:.2f}, SSIM={ssim_val:.4f}")
+        return {
+            'mse': mse,
+            'psnr': psnr,
+            'ssim': ssim_val
+        }
 
     def summarize(self):
-        """
-        汇总所有评估指标并保存结果
-        
-        Returns:
-            包含所有指标的字典
-        """
-
-        """
-        Write your codes here.
-        """
-
-        ret = {}
-        
-        # 计算平均指标
-        if len(self.mse) > 0:
-            ret['mse'] = float(np.mean(self.mse))
-            ret['psnr'] = float(np.mean(self.psnr))
-        
-        if len(self.ssim) > 0:
-            ret['ssim'] = float(np.mean(self.ssim))
-        
-        # 打印结果
-        print("=" * 50)
-        print("评估结果:")
-        for key, value in ret.items():
-            print(f"{key.upper()}: {value:.4f}")
-        print("=" * 50)
-
-        # 保存结果到JSON文件
-        result_file = os.path.join(cfg.result_dir, "metrics.json")
-        try:
-            
-            with open(result_file, 'w') as f:
-                json.dump(ret, f, indent=2)
-            print(f"指标已保存到: {result_file}")
-        except Exception as e:
-            print(f"保存指标文件时出错: {e}")
-        
-        # 清空缓存
+        if len(self.mse) == 0:
+            print("No evaluation results to summarize")
+            return {}
+        mean_mse = np.mean(self.mse)
+        mean_psnr = np.mean(self.psnr)
+        mean_ssim = np.mean(self.ssim)
+        std_mse = np.std(self.mse)
+        std_psnr = np.std(self.psnr)
+        std_ssim = np.std(self.ssim)
+        print("\n" + "="*50)
+        print("EVALUATION SUMMARY")
+        print("="*50)
+        print(f"Number of images: {len(self.mse)}")
+        print(f"MSE:  {mean_mse:.6f} ± {std_mse:.6f}")
+        print(f"PSNR: {mean_psnr:.2f} ± {std_psnr:.2f} dB")
+        print(f"SSIM: {mean_ssim:.4f} ± {std_ssim:.4f}")
+        print("="*50)
+        results = {
+            'summary': {
+                'mean_mse': float(mean_mse),
+                'mean_psnr': float(mean_psnr),
+                'mean_ssim': float(mean_ssim),
+                'std_mse': float(std_mse),
+                'std_psnr': float(std_psnr),
+                'std_ssim': float(std_ssim),
+                'num_images': len(self.mse)
+            },
+            'per_image': []
+        }
+        for i in range(len(self.mse)):
+            results['per_image'].append({
+                'image_name': self.img_names[i],
+                'mse': float(self.mse[i]),
+                'psnr': float(self.psnr[i]),
+                'ssim': float(self.ssim[i])
+            })
+        result_file = os.path.join(cfg.result_dir, "evaluation_results.json")
+        os.makedirs(cfg.result_dir, exist_ok=True)
+        with open(result_file, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"Detailed results saved to: {result_file}")
+        return results['summary']
+    
+    def reset(self):
         self.mse = []
         self.psnr = []
         self.ssim = []
         self.imgs = []
-
-        # # 拼接所有像素
-        # all_pixels = np.concatenate(self.all_pred_pixels, axis=0)  # [H*W, 3]
-        # if all_pixels.shape[0] == self.H * self.W:
-        #     pred_img = all_pixels.reshape(self.H, self.W, 3)
-        #     pred_img8 = (np.clip(pred_img, 0, 1) * 255).astype(np.uint8)
-        #     result_dir = os.path.join(cfg.result_dir, "images")
-        #     os.makedirs(result_dir, exist_ok=True)
-        #     imageio.imwrite(f"{result_dir}/full_pred.png", pred_img8)
-        #     print(f"保存完整预测图片: {result_dir}/full_pred.png")
-        # else:
-        #     print(f"像素数不匹配，无法还原完整图片: {all_pixels.shape[0]} vs {self.H * self.W}")
-        
-        # self.all_pred_pixels = []
-        
-        return ret
-        #pass
+        self.img_names = []

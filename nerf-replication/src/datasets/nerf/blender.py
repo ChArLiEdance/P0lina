@@ -54,6 +54,16 @@ def get_rays_np(H, W, K, c2w):
     rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)
     rays_o = np.broadcast_to(c2w[:3,-1], np.shape(rays_d))
     return rays_o, rays_d
+
+def get_rays(H, W, K, c2w):
+    i, j = torch.meshgrid(torch.linspace(0, W-1, W), torch.linspace(0, H-1, H), indexing='ij')
+    i = i.t()
+    j = j.t()
+    dirs = torch.stack([(i-K[0][2])/K[0][0], -(j-K[1][2])/K[1][1], -torch.ones_like(i)], -1)
+    rays_d = torch.sum(dirs[..., np.newaxis, :] * c2w[:3, :3], -1)
+    rays_o = c2w[:3, -1].expand(rays_d.shape)
+    return rays_o, rays_d
+
 #-----------------------------------------------------dataset类------------------------------------------------------------
 
 class Dataset(data.Dataset):
@@ -68,137 +78,171 @@ class Dataset(data.Dataset):
             None
         """
         super(Dataset, self).__init__()
-        """
-        Write your codes here.
-        """
+        print("Initializing NeRF Blender Dataset...")
+        # 参数优先级：kwargs > cfg > 默认
+        self.split = kwargs.get('split', 'train')
+        scene = kwargs.get('scene', getattr(cfg, 'scene', 'lego'))
+        if hasattr(cfg, 'train_dataset') and hasattr(cfg.train_dataset, 'data_root'):
+            data_root = kwargs.get('data_root', cfg.train_dataset.data_root)
+        else:
+            data_root = kwargs.get('data_root', 'data/nerf_synthetic')
+        if hasattr(cfg, 'train_dataset') and hasattr(cfg.train_dataset, 'input_ratio'):
+            input_ratio = kwargs.get('input_ratio', cfg.train_dataset.input_ratio)
+        else:
+            input_ratio = kwargs.get('input_ratio', 1.0)
+        self.basedir = os.path.join(data_root, scene)
+        self.input_ratio = input_ratio
+        self.white_bkgd = getattr(cfg.task_arg, 'white_bkgd', True) if hasattr(cfg, 'task_arg') else True
+        self.N_rays = getattr(cfg.task_arg, 'N_rays', 1024) if hasattr(cfg, 'task_arg') else 1024
+        self.no_batching = getattr(cfg.task_arg, 'no_batching', True) if hasattr(cfg, 'task_arg') else True
+        self.test_skip = getattr(cfg.task_arg, 'test_skip', 1) if hasattr(cfg, 'task_arg') else 1
+        print(f"Dataset config: split={self.split}, scene={scene}, data_root={data_root}")
+        print(f"Base directory: {self.basedir}")
+        if not os.path.exists(self.basedir):
+            raise FileNotFoundError(f"Dataset directory not found: {self.basedir}")
+        self._load_data()
+        if self.split == 'train' and self.no_batching and len(self.image_paths) > 0:
+            total_pixels = len(self.image_paths) * self.H * self.W
+            if total_pixels <= 10000000:
+                print("Preparing ray batches for training...")
+                self._prepare_ray_batch()
+            else:
+                print(f"Too many pixels ({total_pixels}), using on-demand ray generation")
+        print(f"Dataset initialization completed: {len(self.image_paths)} images")
 
-
-        # 从kwargs读取参数，兼容yaml配置 , kwargs是从yaml配置文件中读取的参数，
-        #子lego中有split，data_root, H, W等参数
-        
-        self.split= kwargs.get('split', 'train')
-        self.data_root=kwargs.get('data_root',getattr(cfg,'data_root',None))
-        self.H = int(kwargs.get('H', 800))
-        self.W = int(kwargs.get('W', 800))
-        self.img_wh = (self.W, self.H)
-        self.input_ratio = float(kwargs.get('input_ratio', 1.0))
-        self.cams = kwargs.get('cams', None)
-        self.half_res = kwargs.get('half_res', False)
-        self.testskip = kwargs.get('testskip', 1)
-        self.near = 2.0
-        self.far = 6.0
-        
-        # 读取 transforms_xxx.json
-        json_path = os.path.join(self.data_root, f"transforms_{self.split}.json")
-        with open(json_path, 'r') as f:
-            meta = json.load(f)
-
-        # 读取图像路径和相机位姿, 
-        self.image_paths = []
-        self.poses = []
-        self.all_rgbs = []
-        self.focal = None
-        self.H_ori, self.W_ori = None, None
-        frames=meta['frames']
-
-
-        #test 可以跳过一些样本
-        if self.split == 'train' or self.testskip == 0:
+    def _load_data(self):
+        print("Loading blender dataset...")
+        splits = ['train', 'val', 'test']
+        metas = {}
+        for s in splits:
+            json_file = os.path.join(self.basedir, f'transforms_{s}.json')
+            if os.path.exists(json_file):
+                with open(json_file, 'r') as fp:
+                    metas[s] = json.load(fp)
+                print(f"Loaded {len(metas[s]['frames'])} frames for {s}")
+            else:
+                print(f"Warning: {json_file} not found")
+        if not metas:
+            raise FileNotFoundError("No transform files found")
+        H, W = 800, 800
+        camera_angle_x = float(metas['train']['camera_angle_x'])
+        focal = .5 * W / np.tan(.5 * camera_angle_x)
+        if self.input_ratio != 1.0:
+            H = int(H * self.input_ratio)
+            W = int(W * self.input_ratio)
+            focal = focal * self.input_ratio
+        print(f"Target image size: {H}x{W}, focal: {focal}")
+        self.K = np.array([
+            [focal, 0, 0.5*W],
+            [0, focal, 0.5*H],
+            [0, 0, 1]
+        ])
+        self.H, self.W, self.focal = H, W, focal
+        self.hwf = [H, W, focal]
+        if self.split == 'train':
+            meta = metas['train']
+            skip = 1
+        elif self.split == 'val':
+            meta = metas['val']
             skip = 1
         else:
-            skip = self.testskip
-        frames = frames[::skip]
-
-
-        # 支持相机选择
-        if self.cams is not None and isinstance(self.cams, list):
-            selected_frames = []
-            for idx in self.cams:
-                if idx >= 0 and idx < len(frames):
-                    selected_frames.append(frames[idx])
-            if selected_frames:
-                frames = selected_frames
-        
-
-        img = []
-        for frame in frames:
-            #获取图像路径
-            img_path = os.path.join(self.data_root, frame['file_path'] + '.png')
-            if not os.path.exists(img_path):
-                img_path = os.path.join(self.data_root, frame['file_path'] + '.jpg')
-            self.image_paths.append(img_path)
-            # 获取图像的原始分辨率
-            self.poses.append(np.array(frame['transform_matrix'], dtype=np.float32))
-            # 获取相机位姿
-            img.append(imageio.imread(img_path))  # 读取图像
-        img= (np.array(img) / 255.).astype(np.float32)  # 保留所有4个通道（RGBA）
-        self.all_rgbs.append(img)
-
-
-        # 将所有图像和位姿合并为一个大数组
-        self.all_rgbs = np.concatenate(self.all_rgbs, 0)
-        if self.all_rgbs.shape[-1] == 4:
-            self.all_rgbs = self.all_rgbs[..., :3]
-        self.pose=np.concatenate(self.poses, 0).astype(np.float32)
-        self.H_ori, self.W_ori = self.all_rgbs.shape[1], self.all_rgbs.shape[2]
-
-
-        # 处理输入分辨率, 如果输入分辨率小于1.0，则缩放图像
-        if self.input_ratio < 1.0:
-            new_H = int(self.H_ori * self.input_ratio)
-            new_W = int(self.W_ori * self.input_ratio)
-            imgs_resized = np.zeros((self.all_rgbs.shape[0], new_H, new_W, 3), dtype=np.float32)
-            for i, img in enumerate(self.all_rgbs):
-                # if img.shape[-1] == 4:
-                #     img = img[..., :3]
-                imgs_resized[i] = cv2.resize(img, (new_W, new_H), interpolation=cv2.INTER_AREA)
-                
-            self.all_rgbs = imgs_resized
-            self.H, self.W = new_H, new_W
+            meta = metas['test']
+            skip = self.test_skip
+        self.image_paths = []
+        self.poses_list = []
+        print(f"Processing {self.split} data with skip={skip}...")
+        for i, frame in enumerate(meta['frames'][::skip]):
+            img_path = os.path.join(self.basedir, frame['file_path'] + '.png')
+            if os.path.exists(img_path):
+                self.image_paths.append(img_path)
+                self.poses_list.append(np.array(frame['transform_matrix'], dtype=np.float32))
+            else:
+                print(f"Warning: Image file not found: {img_path}")
+        print(f"Found {len(self.image_paths)} valid images for {self.split}")
+        if len(self.image_paths) == 0:
+            raise RuntimeError("No images found")
+        self.poses = torch.from_numpy(np.array(self.poses_list)).float()
+        self.K = torch.from_numpy(self.K).float()
+        if self.split == 'train' and len(self.image_paths) <= 100:
+            print("Pre-loading training images...")
+            self._load_all_images()
         else:
-            self.H, self.W = self.H_ori, self.W_ori
-        
-        
-        # 相机内参 - 先基于原始分辨率计算焦距
-        if 'fl_x' in meta:
-            self.focal = meta['fl_x']
-        elif 'camera_angle_x' in meta:
-            # 由视场角和原始宽度计算focal
-            self.focal = 0.5 * self.W_ori / np.tan(0.5 * meta['camera_angle_x'])
+            print(f"Using on-demand loading for {len(self.image_paths)} images")
+            self.imgs = None
+        self.render_poses = torch.stack([pose_spherical(angle, -30.0, 4.0) for angle in np.linspace(-180, 180, 40+1)[:-1]], 0)
+        print(f"Dataset setup completed: {len(self.image_paths)} images of target size {H}x{W}")
+
+    def _load_all_images(self):
+        imgs = []
+        print("Loading all images into memory...")
+        for i, img_path in enumerate(self.image_paths):
+            try:
+                img = imageio.imread(img_path)
+                if self.input_ratio != 1.0:
+                    img = cv2.resize(img, (self.W, self.H), interpolation=cv2.INTER_AREA)
+                imgs.append(img)
+                if (i + 1) % 20 == 0:
+                    print(f"Loaded {i + 1}/{len(self.image_paths)} images")
+            except Exception as e:
+                print(f"Warning: Failed to load image {img_path}: {e}")
+        if imgs:
+            imgs = (np.array(imgs) / 255.).astype(np.float32)
+            if self.white_bkgd:
+                imgs = imgs[..., :3] * imgs[..., -1:] + (1. - imgs[..., -1:])
+            else:
+                imgs = imgs[..., :3]
+            self.imgs = torch.from_numpy(imgs).float()
+            print(f"All images loaded: {self.imgs.shape}")
         else:
-            raise ValueError('No focal length info in transforms json!')
-        
-        
-        # 根据下采样比例调整焦距
-        if self.input_ratio < 1.0:
-            self.focal = self.focal * self.input_ratio
-        if self.half_res:
-            self.focal = self.focal / 2.
+            raise RuntimeError("Failed to load any images")
 
+    def _load_single_image(self, index):
+        img_path = self.image_paths[index]
+        try:
+            img = imageio.imread(img_path)
+            if self.input_ratio != 1.0:
+                img = cv2.resize(img, (self.W, self.H), interpolation=cv2.INTER_AREA)
+            img = (img / 255.).astype(np.float32)
+            if self.white_bkgd:
+                img = img[..., :3] * img[..., -1:] + (1. - img[..., -1:])
+            else:
+                img = img[..., :3]
+            return torch.from_numpy(img).float()
+        except Exception as e:
+            print(f"Error loading image {img_path}: {e}")
+            return torch.zeros(self.H, self.W, 3, dtype=torch.float32)
 
-        # 构造相机内参矩阵K
-        K = np.array([
-            [self.focal, 0, 0.5 * self.W],
-            [0, self.focal, 0.5 * self.H],
-            [0, 0, 1]
-        ], dtype=np.float32)
-
-
-        # 将相机内参转换为torch.Tensor
-        all_rays= []
-        for pose in self.poses:
-            rays_o, rays_d = get_rays_np(self.H, self.W, K, pose)
-            all_rays.append(np.stack([rays_o, rays_d], axis=1).reshape(-1, 2, 3))
-        self.rays = np.concatenate(all_rays, axis=0)  # [N*H*W, 2, 3]
-
-
-        # flatten
-        self.rays = self.rays.reshape(-1, 2, 3)  # [N*H*W, 2, 3]
-        self.all_rgbs = self.all_rgbs.reshape(-1, 3)  # [N*H*W, 3]
-        self.num_rays = self.rays.shape[0]
-
-
-        #pass
+    def _prepare_ray_batch(self):
+        print('Preparing ray batches...')
+        if self.split != 'train':
+            print("Skip ray precomputation for non-training split")
+            return
+        if len(self.imgs) == 0:
+            print("No images to precompute rays")
+            return
+        print(f"Computing rays for {len(self.imgs)} training images of size {self.H}x{self.W}")
+        max_rays_per_image = 1024
+        total_rays_per_image = self.H * self.W
+        if total_rays_per_image <= max_rays_per_image:
+            rays_list = []
+            for i in range(len(self.imgs)):
+                pose = self.poses[i, :3, :4]
+                rays_o, rays_d = get_rays(self.H, self.W, self.K, pose)
+                img = self.imgs[i]
+                rays_o_flat = rays_o.view(-1, 3)
+                rays_d_flat = rays_d.view(-1, 3)
+                img_flat = img.view(-1, 3)
+                rays_rgb = torch.stack([rays_o_flat, rays_d_flat, img_flat], 0).transpose(0, 1)
+                rays_list.append(rays_rgb)
+            self.rays_rgb = torch.cat(rays_list, 0)
+            indices = torch.randperm(self.rays_rgb.shape[0])
+            self.rays_rgb = self.rays_rgb[indices]
+            self.i_batch = 0
+            print(f'Ray batches prepared: {self.rays_rgb.shape[0]} rays total')
+        else:
+            print(f"Images too large ({self.H}x{self.W}), will generate rays on-demand")
+            self.rays_rgb = None
+            self.i_batch = 0
 
     def __getitem__(self, index):
         """
@@ -211,48 +255,78 @@ class Dataset(data.Dataset):
         Output:
             @ret: 包含所需数据的字典
         """
-        """
-        Write your codes here.
-        """
-
-        
-        # 获取光线和对应的 RGB 值
-        N_rays= getattr(cfg, 'N_rays', 1024)
-        if hasattr(self, 'N_rays'):
-            N_rays = self.N_rays
-
-
-        #训练时随机采样光线，测试时不随机采样
-        if self.split == 'train':
-            select_idx= np.random.choice(self.num_rays, N_rays, replace=False)
+        if self.split == 'train' and self.no_batching:
+            if hasattr(self, 'rays_rgb') and self.rays_rgb is not None:
+                batch = self.rays_rgb[self.i_batch:self.i_batch + self.N_rays]
+                batch = batch.transpose(0, 1)
+                batch_rays, target_s = batch[:2], batch[2]
+                self.i_batch += self.N_rays
+                if self.i_batch >= self.rays_rgb.shape[0]:
+                    indices = torch.randperm(self.rays_rgb.shape[0])
+                    self.rays_rgb = self.rays_rgb[indices]
+                    self.i_batch = 0
+                ret = {
+                    'rays_o': batch_rays[0],
+                    'rays_d': batch_rays[1],
+                    'target_s': target_s,
+                    'H': self.H,
+                    'W': self.W,
+                    'K': self.K,
+                    'near': 2.0,
+                    'far': 6.0
+                }
+            else:
+                img_i = np.random.randint(0, len(self.image_paths))
+                if self.imgs is not None:
+                    img = self.imgs[img_i]
+                else:
+                    img = self._load_single_image(img_i)
+                pose = self.poses[img_i, :3, :4]
+                rays_o, rays_d = get_rays(self.H, self.W, self.K, pose)
+                coords = torch.stack(torch.meshgrid(
+                    torch.arange(self.H, dtype=torch.long), 
+                    torch.arange(self.W, dtype=torch.long),
+                    indexing='ij'
+                ), -1)
+                coords = coords.reshape(-1, 2)
+                select_inds = np.random.choice(coords.shape[0], size=self.N_rays, replace=False)
+                select_coords = coords[select_inds]
+                rays_o_selected = rays_o[select_coords[:, 0], select_coords[:, 1]]
+                rays_d_selected = rays_d[select_coords[:, 0], select_coords[:, 1]]
+                target_s = img[select_coords[:, 0], select_coords[:, 1]]
+                ret = {
+                    'rays_o': rays_o_selected,
+                    'rays_d': rays_d_selected,
+                    'target_s': target_s,
+                    'H': self.H,
+                    'W': self.W,
+                    'K': self.K,
+                    'near': 2.0,
+                    'far': 6.0
+                }
         else:
-            start= index * N_rays
-            end = min((index + 1) * N_rays, self.num_rays)
-            select_idx = np.arange(start, end)
-
-        # 获取对应的光线和 RGB 值
-        rays=self.rays[select_idx]
-        rgbs = self.all_rgbs[select_idx]
-        rays_o =rays[:,0]  # [N_rays, 3]
-        rays_d = rays[:, 1]  # [N_rays, 3]..
-
-        #debug
-        # print(f"Debug11 - rays_o shape: {rays_o.shape}")
-        # print(f"Debug11 - rays_d shape: {rays_d.shape}")
-
-
-        # 将光线和 RGB 值转换为 torch.Tensor
-        # 这里的 rays_o 和 rays_d 分别是光线的起点和方向向量
-        # rgbs 是对应的 RGB 颜色值
-        # 返回一个字典，包含光线起点、方向和 RGB 值
-        return {
-            "rays_o": torch.from_numpy(rays_o).float(),
-            "rays_d": torch.from_numpy(rays_d).float(),
-            "rgb": torch.from_numpy(rgbs).float(),
-            "near": torch.full((rays_o.shape[0], 1), self.near, dtype=torch.float32),  
-            "far": torch.full((rays_o.shape[0], 1), self.near, dtype=torch.float32),    
-        }
-        #pass
+            if self.imgs is not None:
+                img = self.imgs[index]
+            else:
+                img = self._load_single_image(index)
+            pose = self.poses[index, :3, :4]
+            rays_o, rays_d = get_rays(self.H, self.W, self.K, pose)
+            rays_o_flat = rays_o.view(-1, 3)
+            rays_d_flat = rays_d.view(-1, 3)
+            img_flat = img.view(-1, 3)
+            ret = {
+                'rays_o': rays_o_flat,
+                'rays_d': rays_d_flat,
+                'target_s': img_flat,
+                'H': self.H,
+                'W': self.W,
+                'K': self.K,
+                'pose': pose,
+                'near': 2.0,
+                'far': 6.0,
+                'img_idx': int(index)
+            }
+        return ret
 
     def __len__(self):
         """
@@ -264,17 +338,7 @@ class Dataset(data.Dataset):
         Output:
             @len: 训练或者测试的数量
         """
-        """
-        Write your codes here.
-        """
-        
-        N_rays = getattr(cfg, 'N_rays', 1024)
-        if hasattr(self, 'N_rays'):
-            N_rays = self.N_rays
-        if self.split == 'train':
-            # 训练时每次采样N_rays条，返回可采样的batch数
-            return max(self.num_rays // N_rays, 1)
+        if self.split == 'train' and self.no_batching and hasattr(self, 'rays_rgb') and self.rays_rgb is not None:
+            return self.rays_rgb.shape[0] // self.N_rays
         else:
-            # 测试时顺序采样，最后一个batch可能不足N_rays
-            return (self.num_rays + N_rays - 1) // N_rays
-        #pass
+            return len(self.image_paths)

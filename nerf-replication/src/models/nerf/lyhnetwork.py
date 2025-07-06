@@ -212,13 +212,11 @@ class Network(nn.Module):
             use_viewdirs=self.use_viewdirs,
         )
 
-        # 多GPU并行现在在Trainer中统一处理，这里只做基本设置
-        print(f"Network初始化完成:")
-        print(f"  - N_samples: {self.N_samples}")
-        print(f"  - N_importance: {self.N_importance}")
-        print(f"  - chunk_size: {self.chunk}")
-        print(f"  - N_rays: {self.batch_size}")
-        print(f"  - use_viewdirs: {self.use_viewdirs}")
+        # 新增：多卡并行
+        if torch.cuda.device_count() > 1:
+            print("使用", torch.cuda.device_count(), "个GPU进行并行训练")
+            self.model = nn.DataParallel(self.model)
+            self.model_fine = nn.DataParallel(self.model_fine)
 
         self.model = self.model.to(self.device)
         self.model_fine = self.model_fine.to(self.device)
